@@ -23,6 +23,8 @@ def cmd_init(args):
     dirs = [
         "raw/papers", "raw/articles", "raw/books", "raw/assets",
         "wiki/pages", "wiki/qa", "wiki/slides",
+        "compiled/source-notes", "registry", "changelog",
+        "wiki/concepts", "wiki/frameworks", "schema",
         "log-archive",
     ]
     for d in dirs:
@@ -68,6 +70,18 @@ def cmd_init(args):
     if not os.path.exists(log_path):
         with open(log_path, 'w') as f:
             f.write("# LLM Wiki Log\n\n")
+
+    # Copy bundled markdown templates into matching wiki subdirectories.
+    SKILL_DIR = Path(__file__).parent.parent
+    templates_dir = SKILL_DIR / 'templates'
+    if templates_dir.exists():
+        for template_path in templates_dir.rglob('*.md'):
+            relative_path = template_path.relative_to(templates_dir)
+            dest_path = Path(root) / relative_path
+            if dest_path.exists():
+                continue
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(template_path, dest_path)
 
     # git init
     if not os.path.exists(os.path.join(root, ".git")):
@@ -583,6 +597,86 @@ def cmd_status(args):
     print(f"  类型: {types}")
     print(f"  操作记录: {log_lines}")
 
+# ─── mvp helpers ───────────────────────────────────────
+
+ID_PREFIXES = {
+    "source": "src",
+    "concept": "cpt",
+    "framework": "frm",
+    "claim": "clm",
+}
+
+ID_DIRS = {
+    "source": "compiled/source-notes",
+    "concept": "wiki/concepts",
+    "framework": "wiki/frameworks",
+    "claim": "registry",
+}
+
+REGISTRY_FILES = {
+    "concept": "concept-registry.md",
+    "claim": "claim-registry.md",
+    "source": "source-registry.md",
+}
+
+
+def cmd_new_id(args):
+    root = Path(get_root(args))
+    prefix = ID_PREFIXES[args.type]
+    today = datetime.now().strftime("%Y%m%d")
+    target_dir = root / ID_DIRS[args.type]
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    pattern = re.compile(rf"^{re.escape(prefix)}_{today}_(\d{{3}})")
+    max_seq = 0
+    for path in target_dir.iterdir():
+        match = pattern.match(path.name)
+        if match:
+            max_seq = max(max_seq, int(match.group(1)))
+
+    print(f"{prefix}_{today}_{max_seq + 1:03d}")
+
+
+def cmd_registry(args):
+    root = Path(get_root(args))
+    registry_path = root / "registry" / REGISTRY_FILES[args.name]
+
+    if args.action == "list":
+        if not registry_path.exists():
+            print(f"❌ Registry not found: {registry_path}")
+            sys.exit(1)
+        print(registry_path.read_text(encoding="utf-8"), end="")
+        return
+
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = args.entry.rstrip()
+    with registry_path.open("a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+    print(f"✅ Registry updated: {registry_path}")
+
+
+def cmd_changelog(args):
+    root = Path(get_root(args))
+    changelog_dir = root / "changelog"
+    changelog_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if args.action == "add":
+        changelog_path = changelog_dir / "changes.md"
+        entry = f"| {today} | {args.change_type} | {args.object} |  | {args.summary} | pending |\n"
+    else:
+        changelog_path = changelog_dir / "pending-review.md"
+        entry = (
+            f"\n## {today}\n\n"
+            f"- 类型：{args.change_type}\n"
+            f"- 影响对象：{args.object}\n"
+            f"- 摘要：{args.summary}\n"
+        )
+
+    with changelog_path.open("a", encoding="utf-8") as f:
+        f.write(entry)
+    print(f"✅ Changelog updated: {changelog_path}")
+
 # ─── main ──────────────────────────────────────────────
 
 def cmd_observe(args):
@@ -678,6 +772,26 @@ def main():
     p_status = sub.add_parser('status', help='查看状态')
     p_status.add_argument('--path', default=None)
 
+    # new-id
+    p_new_id = sub.add_parser('new-id', help='生成 MVP 对象 ID')
+    p_new_id.add_argument('type', choices=['source', 'concept', 'framework', 'claim'])
+    p_new_id.add_argument('--path', default=None)
+
+    # registry
+    p_registry = sub.add_parser('registry', help='读取或追加 registry')
+    p_registry.add_argument('action', choices=['list', 'add'])
+    p_registry.add_argument('name', choices=['concept', 'claim', 'source'])
+    p_registry.add_argument('--entry', default='')
+    p_registry.add_argument('--path', default=None)
+
+    # changelog
+    p_changelog = sub.add_parser('changelog', help='追加 changelog 条目')
+    p_changelog.add_argument('action', choices=['add', 'pending'])
+    p_changelog.add_argument('--change-type', required=True)
+    p_changelog.add_argument('--object', required=True)
+    p_changelog.add_argument('--summary', required=True)
+    p_changelog.add_argument('--path', default=None)
+
     # observe (Obsidian integration)
     p_obs = sub.add_parser('observe', help='Obsidian 集成')
     p_obs.add_argument('action', choices=['link'], help='操作类型')
@@ -742,6 +856,12 @@ def main():
         cmd_lint(args)
     elif args.command == 'status':
         cmd_status(args)
+    elif args.command == 'new-id':
+        cmd_new_id(args)
+    elif args.command == 'registry':
+        cmd_registry(args)
+    elif args.command == 'changelog':
+        cmd_changelog(args)
     elif args.command == 'observe':
         cmd_observe(args)
     elif args.command == 'diff':
