@@ -1355,6 +1355,532 @@ def cmd_rebuild_maps(args):
     print(f"  scanned registries: concepts={len(concept_rows)}, sources={len(source_rows)}, claims={len(claim_rows)}")
     print(f"  scanned pages: {len(pages)}")
 
+# ─── maintain ──────────────────────────────────────────
+
+MAINTENANCE_CHECKS = [
+    "broken-links",
+    "orphan-pages",
+    "concept-dedupe",
+    "stale-claims",
+    "map-drift",
+]
+
+
+def _maintenance_dir(root):
+    """确保维护报告目录存在。"""
+    path = Path(root) / "maintenance"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _wiki_scan_dirs(root):
+    """返回 V2 维护检查覆盖的 Markdown 目录。"""
+    root = Path(root)
+    return [
+        root / "wiki" / "pages",
+        root / "wiki" / "concepts",
+        root / "wiki" / "frameworks",
+        root / "wiki" / "qa",
+    ]
+
+
+def _split_frontmatter_text(content):
+    """保留原文格式拆分 frontmatter 和正文。"""
+    if not content.startswith("---"):
+        return "", content
+    end = content.find("---", 3)
+    if end == -1:
+        return "", content
+    body_start = end + 3
+    while body_start < len(content) and content[body_start] in "\r\n":
+        body_start += 1
+    return content[:body_start], content[body_start:]
+
+
+def _scan_maintenance_pages(root):
+    """扫描维护检查需要读取的页面。"""
+    pages = []
+    for target_dir in _wiki_scan_dirs(root):
+        if not target_dir.exists():
+            continue
+        for path in sorted(target_dir.glob("*.md")):
+            fm, body = parse_frontmatter(path)
+            title = fm.get("title") or path.stem
+            pages.append({
+                "path": path,
+                "rel_path": path.relative_to(Path(root)).as_posix(),
+                "title": str(title).strip() or path.stem,
+                "stem": path.stem,
+                "body": body,
+                "frontmatter": fm,
+            })
+    return pages
+
+
+def _extract_wikilinks(text):
+    """抽取正文中的 Obsidian 风格 wikilink 目标。"""
+    return [link.strip() for link in re.findall(r"\[\[([^\]|#\]]+)", text) if link.strip()]
+
+
+def _normalized_page_names(pages, include_titles=True):
+    """建立大小写不敏感的页面名称集合。"""
+    names = set()
+    for page in pages:
+        names.add(page["stem"].lower())
+        if include_titles:
+            names.add(page["title"].lower())
+    return names
+
+
+def _write_maintenance_report(root, filename, title, lines):
+    """写入单项维护报告。"""
+    report_path = _maintenance_dir(root) / filename
+    content = [f"# {title}\n\n", *lines]
+    report_path.write_text("".join(content), encoding="utf-8")
+    return report_path
+
+
+def _parse_date(value):
+    """解析 registry 中常见日期格式。"""
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text[:10] if fmt != "%Y%m%d" else text[:8], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _claim_created_at(row):
+    """从 claim 行或 ID 推断创建日期。"""
+    direct = _row_value(row, "created", "created_at", "date")
+    parsed = _parse_date(direct)
+    if parsed:
+        return parsed
+    claim_id = _row_value(row, "claim_id", "id")
+    match = re.search(r"clm_(\d{8})_", claim_id)
+    if match:
+        return _parse_date(match.group(1))
+    return None
+
+
+def _pending_review_count(root):
+    """统计 pending-review.md 中尚未处理的条目数。"""
+    pending_path = Path(root) / "changelog" / "pending-review.md"
+    if not pending_path.exists():
+        return 0
+    content = pending_path.read_text(encoding="utf-8")
+    content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+    type_lines = len(re.findall(r"(?m)^-\s*类型[:：]", content))
+    item_headings = len(re.findall(r"(?m)^#{3,}\s*待审核项", content))
+    return max(type_lines, item_headings)
+
+
+def _current_concept_count(root):
+    """按当前 concept registry 计算概念数量。"""
+    rows = _scan_registry_rows(root, "concept")
+    return len([row for row in rows if _row_value(row, "concept_id", "id", "canonical_name", "title", "name")])
+
+
+def _generated_map_concept_counts(root):
+    """读取 generated maps 中可见的概念数量。"""
+    maps_dir = Path(root) / "maps"
+    counts = {}
+    domain_map = maps_dir / "domain-map.generated.md"
+    concept_map = maps_dir / "concept-map.generated.md"
+    if domain_map.exists():
+        counts[domain_map.name] = len(re.findall(r"(?m)^-\s*\[\[", domain_map.read_text(encoding="utf-8")))
+    if concept_map.exists():
+        counts[concept_map.name] = len(re.findall(r"(?m)^##\s+", concept_map.read_text(encoding="utf-8")))
+    return counts
+
+
+def check_broken_links(root, fix=False):
+    """检查正文 wikilink 断链，必要时做非破坏性标记。"""
+    root = Path(root)
+    pages = _scan_maintenance_pages(root)
+    existing_titles = _normalized_page_names(pages, include_titles=True)
+    issues = []
+    broken_by_path = {}
+
+    for page in pages:
+        broken_targets = []
+        for link in sorted(set(_extract_wikilinks(page["body"]))):
+            if link.lower() not in existing_titles:
+                issues.append({
+                    "source": page["rel_path"],
+                    "source_title": page["title"],
+                    "target": link,
+                })
+                broken_targets.append(link.lower())
+        if broken_targets:
+            broken_by_path[page["path"]] = set(broken_targets)
+
+    if fix:
+        link_pattern = re.compile(r"\[\[([^\]|#\]]+)([^\]]*)\]\](?!⚠️)")
+        for path, broken_targets in broken_by_path.items():
+            content = path.read_text(encoding="utf-8")
+            frontmatter, body = _split_frontmatter_text(content)
+
+            def mark_broken(match):
+                target = match.group(1).strip().lower()
+                if target in broken_targets:
+                    return match.group(0) + "⚠️"
+                return match.group(0)
+
+            new_body = link_pattern.sub(mark_broken, body)
+            if new_body != body:
+                path.write_text(frontmatter + new_body, encoding="utf-8")
+
+    lines = [f"- 断链总数: {len(issues)}\n\n"]
+    if issues:
+        lines.append("| source | target |\n|---|---|\n")
+        for issue in issues:
+            lines.append(f"| {_table_cell(issue['source'])} | [[{_table_cell(issue['target'])}]] |\n")
+    else:
+        lines.append("未发现断链。\n")
+    _write_maintenance_report(root, "broken-links.md", "Broken Links", lines)
+    return len(issues)
+
+
+def check_orphan_pages(root):
+    """检查没有入链且未被 index.md 收录的页面。"""
+    root = Path(root)
+    pages = _scan_maintenance_pages(root)
+    inbound = {page["rel_path"]: 0 for page in pages}
+    name_to_rel = {}
+    for page in pages:
+        name_to_rel[page["title"].lower()] = page["rel_path"]
+        name_to_rel[page["stem"].lower()] = page["rel_path"]
+
+    for page in pages:
+        seen_targets = set()
+        for link in _extract_wikilinks(page["body"]):
+            target_rel = name_to_rel.get(link.lower())
+            if target_rel and target_rel != page["rel_path"]:
+                seen_targets.add(target_rel)
+        for target_rel in seen_targets:
+            inbound[target_rel] += 1
+
+    index_links = set()
+    index_path = root / "index.md"
+    if index_path.exists():
+        index_links = {link.lower() for link in _extract_wikilinks(index_path.read_text(encoding="utf-8"))}
+
+    orphans = []
+    for page in pages:
+        if inbound[page["rel_path"]] > 0:
+            continue
+        if page["title"].lower() in index_links or page["stem"].lower() in index_links:
+            continue
+        orphans.append({
+            "title": page["title"],
+            "path": page["rel_path"],
+        })
+
+    lines = [f"- 孤立页总数: {len(orphans)}\n\n"]
+    if orphans:
+        lines.append("| page | path |\n|---|---|\n")
+        for orphan in orphans:
+            lines.append(f"| {_table_cell(orphan['title'])} | {_table_cell(orphan['path'])} |\n")
+    else:
+        lines.append("未发现孤立页面。\n")
+    _write_maintenance_report(root, "orphan-pages.md", "Orphan Pages", lines)
+    return len(orphans)
+
+
+def _concept_records(root):
+    """汇总 concept registry 和概念页 frontmatter。"""
+    root = Path(root)
+    records = []
+    for row in _scan_registry_rows(root, "concept"):
+        concept_id = _row_value(row, "concept_id", "id")
+        canonical = _row_value(row, "canonical_name", "title", "name", default=concept_id)
+        aliases = _as_list(_row_value(row, "aliases", "alias"))
+        records.append({
+            "key": concept_id or canonical,
+            "source": "registry",
+            "title": canonical,
+            "canonical_name": canonical,
+            "aliases": aliases,
+        })
+
+    concept_dir = root / "wiki" / "concepts"
+    if concept_dir.exists():
+        for path in sorted(concept_dir.glob("*.md")):
+            fm, _ = parse_frontmatter(path)
+            title = str(fm.get("title") or path.stem).strip()
+            canonical = str(fm.get("canonical_name") or title).strip()
+            aliases = _as_list(fm.get("aliases")) + _as_list(fm.get("alias"))
+            records.append({
+                "key": path.stem,
+                "source": path.relative_to(root).as_posix(),
+                "title": title,
+                "canonical_name": canonical,
+                "aliases": list(dict.fromkeys(aliases)),
+            })
+    return records
+
+
+def check_concept_dedupe(root):
+    """按 registry 和 frontmatter 查找疑似重复概念。"""
+    records = _concept_records(root)
+    duplicate_pairs = []
+    seen = set()
+
+    def normalized_name(value):
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    def add_pair(left, right, reason):
+        pair_key = tuple(sorted([f"{left['source']}::{left['key']}", f"{right['source']}::{right['key']}"]))
+        reason_key = (pair_key, reason)
+        if reason_key in seen:
+            return
+        seen.add(reason_key)
+        duplicate_pairs.append((left, right, reason))
+
+    for i, left in enumerate(records):
+        for right in records[i + 1:]:
+            if left["key"] and left["key"] == right["key"]:
+                continue
+            left_canonical = left["canonical_name"].strip().lower()
+            right_canonical = right["canonical_name"].strip().lower()
+            left_title = left["title"].strip().lower()
+            right_title = right["title"].strip().lower()
+            left_norm_names = {
+                normalized_name(name)
+                for name in [left_canonical, left_title, *left["aliases"]]
+                if normalized_name(name)
+            }
+            right_norm_names = {
+                normalized_name(name)
+                for name in [right_canonical, right_title, *right["aliases"]]
+                if normalized_name(name)
+            }
+
+            if left_canonical and left_canonical == right_canonical:
+                add_pair(left, right, "canonical_name 精确匹配")
+            if left_norm_names.intersection(right_norm_names):
+                add_pair(left, right, "规范化名称匹配")
+            if left_title and right_title and left_title != right_title:
+                if left_title in right_title or right_title in left_title:
+                    add_pair(left, right, "标题包含关系")
+
+            left_aliases = {alias.lower() for alias in left["aliases"] if alias}
+            right_aliases = {alias.lower() for alias in right["aliases"] if alias}
+            if left_aliases.intersection({right_title, right_canonical}) or right_aliases.intersection({left_title, left_canonical}):
+                add_pair(left, right, "alias 命中另一概念标题或 canonical_name")
+
+    lines = [f"- 疑似重复概念: {len(duplicate_pairs)} 对\n\n"]
+    if duplicate_pairs:
+        lines.append("| concept_a | concept_b | reason |\n|---|---|---|\n")
+        for left, right, reason in duplicate_pairs:
+            left_label = f"{left['title']} ({left['source']})"
+            right_label = f"{right['title']} ({right['source']})"
+            lines.append(f"| {_table_cell(left_label)} | {_table_cell(right_label)} | {_table_cell(reason)} |\n")
+    else:
+        lines.append("未发现疑似重复概念。\n")
+    _write_maintenance_report(root, "dedupe-report.md", "Concept Dedupe", lines)
+    return len(duplicate_pairs)
+
+
+def check_stale_claims(root):
+    """检查过期 pending claim 和 pending-review 队列。"""
+    root = Path(root)
+    cutoff = datetime.now() - timedelta(days=30)
+    stale_claims = []
+    falsification_items = []
+
+    for row in _scan_registry_rows(root, "claim"):
+        status = _row_value(row, "status").strip().lower()
+        claim_id = _row_value(row, "claim_id", "id")
+        claim_text = _row_value(row, "claim", "title", "summary")
+        created_at = _claim_created_at(row)
+        if status == "pending" and created_at and created_at < cutoff:
+            stale_claims.append({
+                "claim_id": claim_id,
+                "claim": claim_text,
+                "created": created_at.strftime("%Y-%m-%d"),
+            })
+        combined_text = " ".join(str(row.get(key, "")) for key in row)
+        if re.search(r"falsification|falsified|证伪|已证伪", combined_text, re.IGNORECASE):
+            falsification_items.append({
+                "claim_id": claim_id,
+                "claim": claim_text,
+            })
+
+    pending_review = _pending_review_count(root)
+    stale_total = len(stale_claims) + len(falsification_items)
+    total = stale_total + pending_review
+    lines = [
+        f"- 过期 pending claim: {len(stale_claims)}\n",
+        f"- 证伪标记 claim: {len(falsification_items)}\n",
+        f"- Pending review: {pending_review}\n",
+        f"- 待处理总数: {total}\n\n",
+    ]
+    if stale_claims:
+        lines.append("## 过期 Pending Claims\n\n| claim_id | created | claim |\n|---|---|---|\n")
+        for item in stale_claims:
+            lines.append(f"| {_table_cell(item['claim_id'])} | {item['created']} | {_table_cell(item['claim'])} |\n")
+        lines.append("\n")
+    if falsification_items:
+        lines.append("## 证伪标记 Claims\n\n| claim_id | claim |\n|---|---|\n")
+        for item in falsification_items:
+            lines.append(f"| {_table_cell(item['claim_id'])} | {_table_cell(item['claim'])} |\n")
+        lines.append("\n")
+    if not stale_claims and not falsification_items and not pending_review:
+        lines.append("未发现过期声明或待审核条目。\n")
+    _write_maintenance_report(root, "stale-claims.md", "Stale Claims", lines)
+    return stale_total
+
+
+def check_map_drift(root, fix=False):
+    """检查 generated maps 与当前 concept registry 的数量漂移。"""
+    root = Path(root)
+    maps_dir = root / "maps"
+    generated_maps = sorted(maps_dir.glob("*.generated.md")) if maps_dir.exists() else []
+    current_count = _current_concept_count(root)
+    map_counts = _generated_map_concept_counts(root)
+    expected_maps = {"domain-map.generated.md", "concept-map.generated.md"}
+    missing_maps = sorted(expected_maps - {path.name for path in generated_maps})
+    mismatches = {
+        name: count
+        for name, count in map_counts.items()
+        if count != current_count
+    }
+    drift_detected = bool(missing_maps or not generated_maps or mismatches)
+    fixed = False
+    report_map_counts = map_counts
+    report_missing_maps = missing_maps
+
+    if drift_detected and fix:
+        cmd_rebuild_maps(argparse.Namespace(path=str(root)))
+        fixed = True
+        rebuilt_maps = sorted(maps_dir.glob("*.generated.md")) if maps_dir.exists() else []
+        report_map_counts = _generated_map_concept_counts(root)
+        report_missing_maps = sorted(expected_maps - {path.name for path in rebuilt_maps})
+
+    lines = [
+        f"- 当前 concept registry 数量: {current_count}\n",
+        f"- Map 不一致: {'是' if drift_detected else '否'}\n",
+        f"- 已自动 rebuild-maps: {'是' if fixed else '否'}\n\n",
+    ]
+    if report_missing_maps:
+        lines.append("## 缺失 Generated Maps\n\n")
+        for name in report_missing_maps:
+            lines.append(f"- {name}\n")
+        lines.append("\n")
+    if report_map_counts:
+        lines.append("## Map 计数\n\n| map | concepts | expected |\n|---|---:|---:|\n")
+        for name, count in sorted(report_map_counts.items()):
+            lines.append(f"| {name} | {count} | {current_count} |\n")
+    else:
+        lines.append("未发现 maps/*.generated.md。\n")
+    _write_maintenance_report(root, "map-drift.md", "Map Drift", lines)
+    return drift_detected
+
+
+def generate_maintenance_report(root, results):
+    """生成每日维护汇总报告并追加 log。"""
+    root = Path(root)
+    report_dir = _maintenance_dir(root)
+    today = datetime.now().strftime("%Y-%m-%d")
+    report_path = report_dir / f"report-{today}.md"
+    pending_review = results.get("pending-review", 0)
+    map_drift = bool(results.get("map-drift", False))
+    lines = [
+        f"# 维护报告 {today}\n\n",
+        "## 摘要\n",
+        f"- 断链: {results.get('broken-links', 0)} 个\n",
+        f"- 孤立页: {results.get('orphan-pages', 0)} 个\n",
+        f"- 疑似重复概念: {results.get('concept-dedupe', 0)} 对\n",
+        f"- 过期声明: {results.get('stale-claims', 0)} 个\n",
+        f"- Map 不一致: {'是' if map_drift else '否'}\n",
+        f"- Pending review: {pending_review} 个\n\n",
+        "## 详情\n",
+        "- [broken-links.md](broken-links.md)\n",
+        "- [orphan-pages.md](orphan-pages.md)\n",
+        "- [dedupe-report.md](dedupe-report.md)\n",
+        "- [stale-claims.md](stale-claims.md)\n",
+        "- [map-drift.md](map-drift.md)\n\n",
+        "## 建议操作\n",
+    ]
+    if results.get("broken-links", 0):
+        lines.append("- 修正或重命名断链目标；如已使用 --fix，优先处理带 ⚠️ 的链接。\n")
+    if results.get("orphan-pages", 0):
+        lines.append("- 为孤立页补充入链，或确认后加入 index.md。\n")
+    if results.get("concept-dedupe", 0):
+        lines.append("- 人工审核疑似重复概念，必要时合并 registry 和页面引用。\n")
+    if results.get("stale-claims", 0):
+        lines.append("- 审核过期 pending claim 和 pending-review 队列，补充证据或更新状态。\n")
+    if map_drift:
+        lines.append("- 运行 `wiki.py maintain map-drift --fix` 或 `wiki.py rebuild-maps` 更新 generated maps。\n")
+    if not any([
+        results.get("broken-links", 0),
+        results.get("orphan-pages", 0),
+        results.get("concept-dedupe", 0),
+        results.get("stale-claims", 0),
+        map_drift,
+    ]):
+        lines.append("- 暂无需要处理的维护事项。\n")
+
+    report_path.write_text("".join(lines), encoding="utf-8")
+    append_log(root, "maintain", report_path.name, [
+        f"broken-links: {results.get('broken-links', 0)}",
+        f"orphan-pages: {results.get('orphan-pages', 0)}",
+        f"concept-dedupe: {results.get('concept-dedupe', 0)}",
+        f"stale-claims: {results.get('stale-claims', 0)}",
+        f"map-drift: {'yes' if map_drift else 'no'}",
+    ])
+    return report_path
+
+
+def cmd_maintain(args):
+    """执行 V2 周期维护检查。"""
+    root = Path(get_root(args))
+    if not (root / "index.md").exists():
+        print("❌ Wiki not initialized. Run: wiki.py init")
+        sys.exit(1)
+
+    selected = args.check or "all"
+    checks = MAINTENANCE_CHECKS if selected == "all" else [selected]
+    results = {
+        "broken-links": 0,
+        "orphan-pages": 0,
+        "concept-dedupe": 0,
+        "stale-claims": 0,
+        "map-drift": False,
+        "pending-review": _pending_review_count(root),
+    }
+
+    print(f"🧰 Running maintenance: {selected}")
+    for check in checks:
+        if check == "broken-links":
+            results[check] = check_broken_links(root, fix=args.fix)
+        elif check == "orphan-pages":
+            results[check] = check_orphan_pages(root)
+        elif check == "concept-dedupe":
+            results[check] = check_concept_dedupe(root)
+        elif check == "stale-claims":
+            results[check] = check_stale_claims(root)
+            results["pending-review"] = _pending_review_count(root)
+        elif check == "map-drift":
+            results[check] = check_map_drift(root, fix=args.fix)
+        print(f"  ✅ {check}: {results[check]}")
+
+    report_path = generate_maintenance_report(root, results)
+    git_commit(root, f"maintain: {datetime.now().strftime('%Y-%m-%d')} report")
+    print("✅ Maintenance completed")
+    print(f"  report: {report_path.relative_to(root).as_posix()}")
+    print(f"  broken-links: {results['broken-links']}")
+    print(f"  orphan-pages: {results['orphan-pages']}")
+    print(f"  concept-dedupe: {results['concept-dedupe']}")
+    print(f"  stale-claims: {results['stale-claims']}")
+    print(f"  map-drift: {'yes' if results['map-drift'] else 'no'}")
+
+
 # ─── main ──────────────────────────────────────────────
 
 def cmd_observe(args):
