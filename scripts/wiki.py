@@ -428,8 +428,11 @@ def save_source_to_raw(root, source):
 
 def cmd_update_raw(args):
     """LLM agent 调用：回填 URL 抓取内容到 raw 文件。"""
-    root = Path(get_root(args))
-    raw_path = root / args.raw_path
+    root = Path(get_root(args)).resolve()
+    raw_path = (root / args.raw_path).resolve()
+    if not raw_path.is_relative_to(root):
+        print(f"❌ Invalid raw path outside wiki root: {args.raw_path}")
+        sys.exit(1)
     if not raw_path.exists():
         print(f"❌ Raw file not found: {raw_path}")
         sys.exit(1)
@@ -484,27 +487,10 @@ def cmd_ingest(args):
     title = ""
 
     if source.startswith('http://') or source.startswith('https://'):
-        # URL 场景：保存占位文件，由 LLM agent 用 web_extract 抓取后调用 update-raw 回填
-        title = source.split('/')[-1][:50] or f"article-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        filename = f"{title}.md"
-        source_type = "article"
-        content = f"---\nsource_url: {source}\ningested: {datetime.now().strftime('%Y-%m-%d')}\n---\n\n<!-- NEEDS_AGENT_FETCH -->\n"
-        raw_path = os.path.join(root, "raw", category, filename)
-        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
-        with open(raw_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"NEEDS_AGENT_FETCH: {source} -> raw/{category}/{filename}")
-        git_commit(root, f"ingest placeholder: {filename}")
-        return {
-            "content": "",
-            "title": title,
-            "category": category,
-            "filename": filename,
-            "raw_path": raw_path,
-            "raw_rel_path": f"raw/{category}/{filename}",
-            "source_type": source_type,
-            "needs_agent_fetch": True,
-        }
+        saved = save_source_to_raw(root, source)
+        if saved.get("needs_agent_fetch"):
+            git_commit(root, f"ingest placeholder: {saved['filename']}")
+            return saved
     elif os.path.isfile(source):
         with open(source, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -1038,11 +1024,13 @@ def cmd_compile(args):
         sys.exit(1)
 
     print(f"📚 Compiling: {source}")
-    try:
-        saved = save_source_to_raw(root, source)
-    except RuntimeError as e:
-        print(f"❌ {e}")
-        sys.exit(1)
+    saved = save_source_to_raw(root, source)
+
+    if saved.get("needs_agent_fetch"):
+        print("✅ Raw placeholder saved; agent fetch required before compile.")
+        print(f"  raw: {saved['raw_rel_path']}")
+        print("  needs_agent_fetch: true")
+        return
 
     content = saved["content"]
     # L0 是碎片归档，不做正文长度检查；L1-L3 需要有可编译正文。
