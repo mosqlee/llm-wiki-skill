@@ -1983,6 +1983,18 @@ def main():
     p_maps = sub.add_parser('rebuild-maps', help='重建 generated maps')
     p_maps.add_argument('--path', default=None)
 
+    # maintain
+    p_maintain = sub.add_parser('maintain', help='运行 V2 周期维护检查')
+    p_maintain.add_argument(
+        'check',
+        nargs='?',
+        choices=['broken-links', 'orphan-pages', 'concept-dedupe', 'stale-claims', 'map-drift', 'all'],
+        default='all',
+        help='维护检查类型，默认运行全部',
+    )
+    p_maintain.add_argument('--fix', action='store_true', help='对支持的检查执行非破坏性修复')
+    p_maintain.add_argument('--path', default=None)
+
     # query
     p_query = sub.add_parser('query', help='查询知识库')
     p_query.add_argument('question', help='查询问题')
@@ -2084,6 +2096,8 @@ def main():
         cmd_promote(args)
     elif args.command == 'rebuild-maps':
         cmd_rebuild_maps(args)
+    elif args.command == 'maintain':
+        cmd_maintain(args)
     elif args.command == 'query':
         cmd_query(args)
     elif args.command == 'lint':
