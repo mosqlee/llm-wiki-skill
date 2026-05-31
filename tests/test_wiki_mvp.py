@@ -16,6 +16,15 @@ def run_wiki(*args):
     )
 
 
+def run_wiki_unchecked(*args):
+    return subprocess.run(
+        [str(PYTHON), str(SCRIPT), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_init_creates_mvp_dirs_and_copies_templates(tmp_path):
     root = tmp_path / "wiki"
 
@@ -104,3 +113,57 @@ def test_changelog_add_and_pending_append_entries(tmp_path):
 
     assert "Expanded definition" in (changelog / "changes.md").read_text(encoding="utf-8")
     assert "Needs evidence check" in (changelog / "pending-review.md").read_text(encoding="utf-8")
+
+
+def test_compile_url_exits_after_agent_fetch_placeholder(tmp_path):
+    root = tmp_path / "wiki"
+    run_wiki("init", "--path", str(root))
+
+    result = run_wiki(
+        "compile",
+        "https://example.com/articles/test-source?utm=1",
+        "--path",
+        str(root),
+    )
+
+    assert "NEEDS_AGENT_FETCH: https://example.com/articles/test-source?utm=1 -> raw/articles/test-source.md" in result.stdout
+    assert "needs_agent_fetch: true" in result.stdout
+    assert "Content too short" not in result.stdout
+    assert (root / "raw" / "articles" / "test-source.md").is_file()
+    assert not any((root / "compiled" / "source-notes").glob("src_*.md"))
+
+
+def test_update_raw_rejects_path_traversal(tmp_path):
+    root = tmp_path / "wiki"
+    run_wiki("init", "--path", str(root))
+    outside = tmp_path / "escape.md"
+    outside.write_text("---\nsource_url: https://example.com\n---\n\noriginal", encoding="utf-8")
+
+    result = run_wiki_unchecked(
+        "update-raw",
+        "../escape.md",
+        "--content",
+        "replacement content that must not be written",
+        "--path",
+        str(root),
+    )
+
+    assert result.returncode != 0
+    assert "Invalid raw path" in result.stdout
+    assert outside.read_text(encoding="utf-8").endswith("original")
+
+
+def test_ingest_url_uses_shared_raw_saving_logic(tmp_path):
+    root = tmp_path / "wiki"
+    run_wiki("init", "--path", str(root))
+
+    result = run_wiki(
+        "ingest",
+        "https://example.com/articles/shared-source?utm=1",
+        "--path",
+        str(root),
+    )
+
+    assert "NEEDS_AGENT_FETCH: https://example.com/articles/shared-source?utm=1 -> raw/articles/shared-source.md" in result.stdout
+    assert (root / "raw" / "articles" / "shared-source.md").is_file()
+    assert not (root / "raw" / "articles" / "shared-source?utm=1.md").exists()

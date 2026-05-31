@@ -349,6 +349,125 @@ sources:
     
     return filepath
 
+
+def save_source_to_raw(root, source):
+    """按 ingest 规则保存来源资料到 raw/，返回元数据。"""
+    root_path = Path(root)
+    content = ""
+    filename = ""
+    category = "articles"
+    title = ""
+    source_type = "article"
+
+    if source.startswith('http://') or source.startswith('https://'):
+        title = source.split('/')[-1].split('?')[0][:50] or f"article-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        title = title.replace('/', '-').replace('\\', '-').replace(':', '-')
+        filename = f"{title}.md"
+        category = 'articles'
+        source_type = 'article'
+        # URL 只落占位文件，由 LLM agent 抓取正文后调用 update-raw 回填。
+        content = f"---\nsource_url: {source}\ningested: {datetime.now().strftime('%Y-%m-%d')}\n---\n\n<!-- NEEDS_AGENT_FETCH -->\n"
+        raw_path = root_path / "raw" / category / filename
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = acquire_lock(str(root_path))
+        try:
+            raw_path.write_text(content, encoding='utf-8')
+        finally:
+            release_lock(lock)
+        print(f"NEEDS_AGENT_FETCH: {source} -> {raw_path.relative_to(root_path).as_posix()}")
+        return {
+            "content": "",
+            "title": title,
+            "category": category,
+            "filename": filename,
+            "raw_path": raw_path,
+            "raw_rel_path": raw_path.relative_to(root_path).as_posix(),
+            "source_type": source_type,
+            "needs_agent_fetch": True,
+        }
+    elif os.path.isfile(source):
+        source_path = Path(source)
+        content = source_path.read_text(encoding='utf-8')
+        filename = source_path.name
+        # 根据路径粗略判断 raw 分类，与 ingest 保持一致。
+        source_lower = source.lower()
+        if 'paper' in source_lower:
+            category = 'papers'
+            source_type = "paper"
+        elif 'book' in source_lower:
+            category = 'books'
+            source_type = "book"
+    else:
+        # 直接文本保存为 note。
+        content = source
+        title = f"note-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        filename = f"{title}.md"
+        source_type = "text"
+
+    if not title:
+        title = filename.replace('.md', '').replace('.txt', '')
+
+    raw_path = root_path / "raw" / category / filename
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = acquire_lock(str(root_path))
+    try:
+        raw_path.write_text(content, encoding='utf-8')
+    finally:
+        release_lock(lock)
+
+    return {
+        "content": content,
+        "title": title,
+        "category": category,
+        "filename": filename,
+        "raw_path": raw_path,
+        "raw_rel_path": raw_path.relative_to(root_path).as_posix(),
+        "source_type": source_type,
+    }
+
+
+def cmd_update_raw(args):
+    """LLM agent 调用：回填 URL 抓取内容到 raw 文件。"""
+    root = Path(get_root(args)).resolve()
+    raw_path = (root / args.raw_path).resolve()
+    if not raw_path.is_relative_to(root):
+        print(f"❌ Invalid raw path outside wiki root: {args.raw_path}")
+        sys.exit(1)
+    if not raw_path.exists():
+        print(f"❌ Raw file not found: {raw_path}")
+        sys.exit(1)
+
+    content_arg = args.content
+    if content_arg and os.path.isfile(content_arg):
+        new_content = Path(content_arg).read_text(encoding='utf-8')
+    else:
+        new_content = content_arg
+
+    existing = raw_path.read_text(encoding='utf-8')
+    source_url = ''
+    if existing.startswith('---'):
+        end = existing.find('---', 3)
+        if end != -1:
+            for line in existing[3:end].strip().split('\n'):
+                if line.startswith('source_url:'):
+                    source_url = line.split(':', 1)[1].strip().strip('"').strip("'")
+                    break
+
+    import hashlib
+    sha256 = hashlib.sha256(new_content.encode('utf-8')).hexdigest()
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    header = f"---\nsource_url: {source_url}\ningested: {today}\nsha256: {sha256}\n---\n\n"
+    lock = acquire_lock(str(root))
+    try:
+        raw_path.write_text(header + new_content, encoding='utf-8')
+    finally:
+        release_lock(lock)
+
+    git_commit(str(root), f"update-raw: {raw_path.name}")
+    print(f"✅ Raw updated: {raw_path.relative_to(root)} ({len(new_content)} chars)")
+    print(f"  sha256: {sha256[:16]}...")
+
 def cmd_ingest(args):
     root = get_root(args)
     source = args.source
@@ -368,22 +487,10 @@ def cmd_ingest(args):
     title = ""
 
     if source.startswith('http://') or source.startswith('https://'):
-        # Fetch via zhipu web reader
-        reader = os.path.expanduser("~/.openclaw/workspace/skills/base/zhipu-toolkit/scripts/zhipu_api.py")
-        if os.path.exists(reader):
-            result = subprocess.run(
-                ["python3", reader, "read", source, "--format", "markdown"],
-                capture_output=True, text=True, timeout=60
-            )
-            content = result.stdout
-            if not content or len(content) < 100:
-                print("⚠️ Web fetch returned too little content, falling back to web_fetch")
-                content = ""
-        if not content:
-            print("❌ Failed to fetch URL. Try saving locally first.")
-            sys.exit(1)
-        title = source.split('/')[-1][:50] or f"article-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        filename = f"{title}.md"
+        saved = save_source_to_raw(root, source)
+        if saved.get("needs_agent_fetch"):
+            git_commit(root, f"ingest placeholder: {saved['filename']}")
+            return saved
     elif os.path.isfile(source):
         with open(source, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -615,16 +722,19 @@ ID_DIRS = {
 
 REGISTRY_FILES = {
     "concept": "concept-registry.md",
+    "framework": "framework-registry.md",
     "claim": "claim-registry.md",
     "source": "source-registry.md",
+    "page": "page-registry.md",
 }
 
 
-def cmd_new_id(args):
-    root = Path(get_root(args))
-    prefix = ID_PREFIXES[args.type]
+def generate_new_id(root, object_type):
+    """按现有目录中最大序号生成下一个对象 ID。"""
+    root = Path(root)
+    prefix = ID_PREFIXES[object_type]
     today = datetime.now().strftime("%Y%m%d")
-    target_dir = root / ID_DIRS[args.type]
+    target_dir = root / ID_DIRS[object_type]
     target_dir.mkdir(parents=True, exist_ok=True)
 
     pattern = re.compile(rf"^{re.escape(prefix)}_{today}_(\d{{3}})")
@@ -634,7 +744,12 @@ def cmd_new_id(args):
         if match:
             max_seq = max(max_seq, int(match.group(1)))
 
-    print(f"{prefix}_{today}_{max_seq + 1:03d}")
+    return f"{prefix}_{today}_{max_seq + 1:03d}"
+
+
+def cmd_new_id(args):
+    root = Path(get_root(args))
+    print(generate_new_id(root, args.type))
 
 
 def cmd_registry(args):
@@ -655,6 +770,190 @@ def cmd_registry(args):
     print(f"✅ Registry updated: {registry_path}")
 
 
+def _table_cell(value):
+    """清理 Markdown 表格单元格，避免换行或竖线破坏表格。"""
+    return str(value).replace("\n", " ").replace("|", "\\|").strip()
+
+
+def _split_md_table_row(line):
+    """按未转义竖线拆分 Markdown 表格行。"""
+    stripped = line.strip()
+    if not stripped.startswith("|"):
+        return []
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    stripped = stripped[1:]
+
+    cells = []
+    current = []
+    escaped = False
+    for ch in stripped:
+        if ch == "\\" and not escaped:
+            escaped = True
+            current.append(ch)
+            continue
+        if ch == "|" and not escaped:
+            cells.append("".join(current).replace("\\|", "|").strip())
+            current = []
+        else:
+            current.append(ch)
+        escaped = False
+    cells.append("".join(current).replace("\\|", "|").strip())
+    return cells
+
+
+def _is_table_separator(cells):
+    """判断是否为 Markdown 表格分隔行。"""
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def read_markdown_table(path):
+    """读取首个 Markdown 表格，返回 lines、headers、rows。"""
+    path = Path(path)
+    if not path.exists():
+        return [], [], []
+
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    headers = []
+    rows = []
+    for idx, line in enumerate(lines):
+        cells = _split_md_table_row(line)
+        if not cells:
+            continue
+        if _is_table_separator(cells):
+            continue
+        if not headers:
+            headers = cells
+            continue
+        padded = cells + [""] * max(0, len(headers) - len(cells))
+        rows.append({
+            "__line_index": idx,
+            "__cells": padded[:len(headers)],
+            **{headers[i]: padded[i] if i < len(padded) else "" for i in range(len(headers))},
+        })
+    return lines, headers, rows
+
+
+def find_registry_entry(root, registry_name, object_id):
+    """按 ID 查找 registry 表格条目。"""
+    root = Path(root)
+    registry_path = root / "registry" / REGISTRY_FILES[registry_name]
+    _, headers, rows = read_markdown_table(registry_path)
+    if not headers:
+        return registry_path, None
+
+    id_candidates = [f"{registry_name}_id", "id", headers[0]]
+    for row in rows:
+        for key in id_candidates:
+            if row.get(key) == object_id:
+                return registry_path, row
+    return registry_path, None
+
+
+def update_registry_row(root, registry_name, object_id, values):
+    """更新 registry 指定行的部分字段。"""
+    root = Path(root)
+    registry_path = root / "registry" / REGISTRY_FILES[registry_name]
+    lines, headers, rows = read_markdown_table(registry_path)
+    if not headers:
+        return False
+
+    id_candidates = [f"{registry_name}_id", "id", headers[0]]
+    for row in rows:
+        if not any(row.get(key) == object_id for key in id_candidates):
+            continue
+        cells = row["__cells"] + [""] * max(0, len(headers) - len(row["__cells"]))
+        for key, value in values.items():
+            if key in headers:
+                cells[headers.index(key)] = _table_cell(value)
+        lines[row["__line_index"]] = "| " + " | ".join(cells[:len(headers)]) + " |\n"
+        lock = acquire_lock(str(root))
+        try:
+            registry_path.write_text("".join(lines), encoding="utf-8")
+        finally:
+            release_lock(lock)
+        return True
+    return False
+
+
+def auto_register_source(root, source_id, title, source_type, raw_path, level):
+    """自动追加 source registry 条目。"""
+    root = Path(root)
+    registry_path = root / "registry" / "source-registry.md"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    source_note = f"compiled/source-notes/{source_id}.md"
+    entry = (
+        f"| {_table_cell(source_id)} | {_table_cell(title)} | {_table_cell(source_type)} | "
+        f"{_table_cell(raw_path)} | {_table_cell(source_note)} | {_table_cell(level)} | pending | {today} |\n"
+    )
+
+    lock = acquire_lock(str(root))
+    try:
+        with registry_path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+    finally:
+        release_lock(lock)
+    return registry_path
+
+
+def auto_page_register(root, page_id, title, page_type, path):
+    """自动追加 page registry 条目。"""
+    root = Path(root)
+    registry_path = root / "registry" / "page-registry.md"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    if not registry_path.exists():
+        registry_path.write_text(
+            "# Page Registry\n\n"
+            "| page_id | title | type | path | created |\n"
+            "|---|---|---|---|---|\n",
+            encoding="utf-8",
+        )
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    page_path = Path(path)
+    if page_path.is_absolute():
+        try:
+            page_path = page_path.relative_to(root)
+        except ValueError:
+            pass
+    entry = (
+        f"| {_table_cell(page_id)} | {_table_cell(title)} | {_table_cell(page_type)} | "
+        f"{_table_cell(page_path.as_posix())} | {today} |\n"
+    )
+
+    lock = acquire_lock(str(root))
+    try:
+        with registry_path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+    finally:
+        release_lock(lock)
+    return registry_path
+
+
+def append_changelog_change(root, change_type, object_id, summary, source=""):
+    """按 changelog add 格式追加 changes.md。"""
+    root = Path(root)
+    changelog_dir = root / "changelog"
+    changelog_dir.mkdir(parents=True, exist_ok=True)
+    changelog_path = changelog_dir / "changes.md"
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = (
+        f"| {today} | {_table_cell(change_type)} | {_table_cell(object_id)} | "
+        f"{_table_cell(source)} | {_table_cell(summary)} | pending |\n"
+    )
+
+    lock = acquire_lock(str(root))
+    try:
+        with changelog_path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+    finally:
+        release_lock(lock)
+    return changelog_path
+
+
 def cmd_changelog(args):
     root = Path(get_root(args))
     changelog_dir = root / "changelog"
@@ -662,8 +961,12 @@ def cmd_changelog(args):
     today = datetime.now().strftime("%Y-%m-%d")
 
     if args.action == "add":
-        changelog_path = changelog_dir / "changes.md"
-        entry = f"| {today} | {args.change_type} | {args.object} |  | {args.summary} | pending |\n"
+        changelog_path = append_changelog_change(
+            root,
+            args.change_type,
+            args.object,
+            args.summary,
+        )
     else:
         changelog_path = changelog_dir / "pending-review.md"
         entry = (
@@ -672,10 +975,385 @@ def cmd_changelog(args):
             f"- 影响对象：{args.object}\n"
             f"- 摘要：{args.summary}\n"
         )
-
-    with changelog_path.open("a", encoding="utf-8") as f:
-        f.write(entry)
+        with changelog_path.open("a", encoding="utf-8") as f:
+            f.write(entry)
     print(f"✅ Changelog updated: {changelog_path}")
+
+
+def create_source_note(root, source_id, title, source_type, raw_path, level):
+    """创建 V1 source-note 占位文件。"""
+    root = Path(root)
+    today = datetime.now().strftime("%Y-%m-%d")
+    note_path = root / "compiled" / "source-notes" / f"{source_id}.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    content = f"""---
+source_id: {source_id}
+title: {title}
+source_type: {source_type}
+raw_path: {raw_path}
+level: {level}
+created: {today}
+---
+
+# {title}
+
+## 核心观点
+
+## 关键概念
+
+## 待验证声明
+
+## 关联
+"""
+
+    lock = acquire_lock(str(root))
+    try:
+        note_path.write_text(content, encoding="utf-8")
+    finally:
+        release_lock(lock)
+    return note_path
+
+
+def cmd_compile(args):
+    root = Path(get_root(args))
+    source = args.source
+    level = args.level
+
+    if not (root / "index.md").exists():
+        print("❌ Wiki not initialized. Run: wiki.py init")
+        sys.exit(1)
+
+    print(f"📚 Compiling: {source}")
+    saved = save_source_to_raw(root, source)
+
+    if saved.get("needs_agent_fetch"):
+        print("✅ Raw placeholder saved; agent fetch required before compile.")
+        print(f"  raw: {saved['raw_rel_path']}")
+        print("  needs_agent_fetch: true")
+        return
+
+    content = saved["content"]
+    # L0 是碎片归档，不做正文长度检查；L1-L3 需要有可编译正文。
+    if level != 'L0' and (not content or len(content) < 20):
+        print("❌ Content too short to compile.")
+        sys.exit(1)
+
+    source_id = generate_new_id(root, "source")
+    title = saved["title"]
+    source_type = saved["source_type"]
+    raw_rel_path = saved["raw_rel_path"]
+
+    # 脚本只做确定性步骤；概念/声明/Mutation 由 LLM agent 后续完成。
+    note_path = create_source_note(root, source_id, title, source_type, raw_rel_path, level)
+    registry_path = auto_register_source(root, source_id, title, source_type, raw_rel_path, level)
+    changelog_path = append_changelog_change(
+        root,
+        "compile",
+        source_id,
+        f"编译资料：{title}",
+        source_id,
+    )
+    append_log(root, "compile", title, [
+        f"source_id: {source_id}",
+        f"raw: {raw_rel_path}",
+        f"source-note: {note_path.relative_to(root).as_posix()}",
+        f"level: {level}",
+    ])
+    git_commit(root, f"compile: {source_id} {title}")
+
+    print("✅ Compile completed")
+    print(f"  source_id: {source_id}")
+    print(f"  raw: {raw_rel_path} ({len(content)} chars)")
+    print(f"  source-note: {note_path.relative_to(root).as_posix()}")
+    print(f"  registry: {registry_path.relative_to(root).as_posix()}")
+    print(f"  changelog: {changelog_path.relative_to(root).as_posix()}")
+    if saved.get("needs_agent_fetch"):
+        print("  needs_agent_fetch: true")
+
+
+def _row_value(row, *keys, default=""):
+    """从 registry 行中按多个候选字段取值。"""
+    for key in keys:
+        value = row.get(key)
+        if value:
+            return value
+    return default
+
+
+def _as_list(value):
+    """把 frontmatter/registry 字段统一为列表。"""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [v.strip() for v in re.split(r"[,，;；]", str(value)) if v.strip()]
+
+
+def _is_placeholder_link(value):
+    """过滤模板中的示例链接，避免 generated maps 收录占位符。"""
+    placeholders = {
+        "cpt_上位概念", "cpt_下位概念", "cpt_相关概念1", "cpt_相关概念2",
+        "cpt_对立概念", "cpt_xxx", "cpt_yyy", "clm_xxx", "clm_yyy", "frm_xxx",
+    }
+    return value in placeholders
+
+
+def _template_path(root, page_type):
+    """优先读取 wiki root 下 init 复制的模板，缺失时回退到内置模板。"""
+    root = Path(root)
+    filename = f"TEMPLATE.{page_type}.md"
+    copied = root / "schema" / filename
+    if copied.exists():
+        return copied
+    return Path(__file__).parent.parent / "templates" / "schema" / filename
+
+
+def render_promoted_page(root, page_type, object_id, entry):
+    """用 schema 模板渲染 promoted 页面。"""
+    template_path = _template_path(root, page_type)
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template not found: {template_path}")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    title = _row_value(entry, "canonical_name", "title", "name", default=object_id)
+    domain = _row_value(entry, "domain", default="未分类")
+    description = _row_value(entry, "one_line_def", "definition", "description", "summary")
+    confidence = _row_value(entry, "confidence", default="medium")
+
+    content = template_path.read_text(encoding="utf-8")
+    if page_type == "concept":
+        replacements = {
+            "cpt_概念名称": object_id,
+            "概念中文名称": title,
+            "concept_english_name": title,
+            "领域标签": domain,
+            "active / draft / archived / contested": "active",
+            "high / medium / low / speculative": confidence,
+            "YYYY-MM-DD": today,
+        }
+        for old, new in replacements.items():
+            content = content.replace(old, str(new))
+        if description:
+            content = content.replace(f"[{title}] 是 [定义]。", f"{title} 是 {description}。")
+            content = content.replace("[概念名称] 是 [定义]。", f"{title} 是 {description}。")
+    else:
+        replacements = {
+            "frm_框架名称": object_id,
+            "框架中文名称": title,
+            "领域标签": domain,
+            "active / draft / archived / contested": "active",
+            "high / medium / low / speculative": confidence,
+            "YYYY-MM-DD": today,
+        }
+        for old, new in replacements.items():
+            content = content.replace(old, str(new))
+
+    return content, title, domain, description
+
+
+def cmd_promote(args):
+    root = Path(get_root(args))
+    object_id = args.id
+    page_type = args.type
+    if not page_type:
+        if object_id.startswith("cpt_"):
+            page_type = "concept"
+        elif object_id.startswith("frm_"):
+            page_type = "framework"
+        else:
+            print("❌ Cannot infer type. Use --type concept|framework.")
+            sys.exit(1)
+
+    if not (root / "index.md").exists():
+        print("❌ Wiki not initialized. Run: wiki.py init")
+        sys.exit(1)
+
+    registry_path, entry = find_registry_entry(root, page_type, object_id)
+    if not entry:
+        print(f"❌ Registry entry not found: {object_id} in {registry_path}")
+        sys.exit(1)
+
+    try:
+        content, title, _, description = render_promoted_page(root, page_type, object_id, entry)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    # 按对象类型写入正式页面目录。
+    subdir = "concepts" if page_type == "concept" else "frameworks"
+    page_path = root / "wiki" / subdir / f"{object_id}.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = acquire_lock(str(root))
+    try:
+        page_path.write_text(content, encoding="utf-8")
+    finally:
+        release_lock(lock)
+
+    rel_page = page_path.relative_to(root).as_posix()
+    update_values = {"status": "active", "page": rel_page}
+    update_registry_row(root, page_type, object_id, update_values)
+    page_registry = auto_page_register(root, object_id, title, page_type, rel_page)
+    changelog_path = append_changelog_change(
+        root,
+        "promote",
+        object_id,
+        f"提拔为 {page_type} 页面：{title}",
+        object_id,
+    )
+    append_log(root, "promote", title, [
+        f"id: {object_id}",
+        f"type: {page_type}",
+        f"page: {rel_page}",
+    ])
+    git_commit(root, f"promote: {object_id} {title}")
+
+    print("✅ Promote completed")
+    print(f"  id: {object_id}")
+    print(f"  type: {page_type}")
+    print(f"  page: {rel_page}")
+    print(f"  registry: {registry_path.relative_to(root).as_posix()} status=active")
+    print(f"  page-registry: {page_registry.relative_to(root).as_posix()}")
+    print(f"  changelog: {changelog_path.relative_to(root).as_posix()}")
+    if description:
+        print(f"  description: {description}")
+
+
+def _scan_registry_rows(root, registry_name):
+    """读取 registry 行，缺失时返回空列表。"""
+    registry_path = Path(root) / "registry" / REGISTRY_FILES[registry_name]
+    _, _, rows = read_markdown_table(registry_path)
+    return rows
+
+
+def _scan_content_pages(root):
+    """扫描 wiki 页面 frontmatter 和正文链接。"""
+    root = Path(root)
+    pages = []
+    for rel_dir in ["wiki/concepts", "wiki/frameworks", "wiki/pages"]:
+        target_dir = root / rel_dir
+        if not target_dir.exists():
+            continue
+        for path in sorted(target_dir.glob("*.md")):
+            fm, body = parse_frontmatter(path)
+            pages.append({
+                "id": fm.get("id") or path.stem,
+                "title": fm.get("title") or path.stem,
+                "type": fm.get("type") or rel_dir.split("/")[-1].rstrip("s"),
+                "domain": str(fm.get("domain") or "未分类") if not isinstance(fm.get("domain"), list) else ", ".join(fm.get("domain", [])) or "未分类",
+                "sources": _as_list(fm.get("sources")),
+                "related": [link for link in dict.fromkeys(
+                    _as_list(fm.get("related")) +
+                    _as_list(fm.get("related_concepts")) +
+                    extract_related_from_body(body) +
+                    re.findall(r"\[\[([^\]|#\]]+)", body)
+                ) if not _is_placeholder_link(link)],
+                "path": path,
+            })
+    return pages
+
+
+def _source_label(source_id, source_rows):
+    """把 source_id 显示为可读标签。"""
+    for row in source_rows:
+        if row.get("source_id") == source_id:
+            title = row.get("title") or source_id
+            return f"{source_id} ({title})"
+    return source_id
+
+
+def cmd_rebuild_maps(args):
+    root = Path(get_root(args))
+    if not (root / "index.md").exists():
+        print("❌ Wiki not initialized. Run: wiki.py init")
+        sys.exit(1)
+
+    maps_dir = root / "maps"
+    maps_dir.mkdir(parents=True, exist_ok=True)
+
+    concept_rows = _scan_registry_rows(root, "concept")
+    source_rows = _scan_registry_rows(root, "source")
+    claim_rows = _scan_registry_rows(root, "claim")
+    pages = _scan_content_pages(root)
+
+    # 先以 registry 为主，再用页面 frontmatter 补充/覆盖可展示字段。
+    concepts = {}
+    for row in concept_rows:
+        concept_id = _row_value(row, "concept_id", "id")
+        if not concept_id:
+            continue
+        concepts[concept_id] = {
+            "id": concept_id,
+            "title": _row_value(row, "canonical_name", "title", "name", default=concept_id),
+            "domain": _row_value(row, "domain", default="未分类"),
+            "description": _row_value(row, "one_line_def", "definition", "description"),
+            "sources": [],
+            "related": [],
+        }
+
+    for page in pages:
+        if page["type"] != "concept":
+            continue
+        concept = concepts.setdefault(page["id"], {
+            "id": page["id"],
+            "title": page["title"],
+            "domain": page["domain"],
+            "description": "",
+            "sources": [],
+            "related": [],
+        })
+        concept["title"] = page["title"] or concept["title"]
+        concept["domain"] = page["domain"] or concept["domain"]
+        concept["sources"].extend(page["sources"])
+        concept["related"].extend(page["related"])
+
+    # 从 claim registry 反推概念来源和相关项。
+    for row in claim_rows:
+        related_field = " ".join([
+            _row_value(row, "related_concepts"),
+            _row_value(row, "target_page"),
+            _row_value(row, "claim"),
+        ])
+        source_id = _row_value(row, "source")
+        for concept in concepts.values():
+            if concept["id"] in related_field or concept["title"] in related_field:
+                if source_id:
+                    concept["sources"].append(source_id)
+                for related in _as_list(_row_value(row, "related_concepts")):
+                    if related and related not in (concept["id"], concept["title"]):
+                        concept["related"].append(related)
+
+    domain_groups = {}
+    for concept in concepts.values():
+        domain_groups.setdefault(concept["domain"] or "未分类", []).append(concept)
+
+    domain_lines = ["# Domain Map (Generated)\n\n"]
+    for domain in sorted(domain_groups):
+        domain_lines.append(f"## {domain}\n")
+        for concept in sorted(domain_groups[domain], key=lambda c: c["title"]):
+            desc = concept["description"] or "暂无描述"
+            domain_lines.append(f"- [[{concept['title']}]] — {desc}\n")
+        domain_lines.append("\n")
+
+    concept_lines = ["# Concept Map (Generated)\n\n"]
+    for concept in sorted(concepts.values(), key=lambda c: c["title"]):
+        sources = list(dict.fromkeys([s for s in concept["sources"] if s]))
+        related = list(dict.fromkeys([r for r in concept["related"] if r and r != concept["title"]]))
+        source_text = ", ".join(_source_label(s, source_rows) for s in sources) if sources else "none"
+        related_text = ", ".join(f"[[{r}]]" for r in related) if related else "none"
+        concept_lines.append(f"## {concept['title']}\n")
+        concept_lines.append(f"- sources: {source_text}\n")
+        concept_lines.append(f"- related: {related_text}\n\n")
+
+    domain_map = maps_dir / "domain-map.generated.md"
+    concept_map = maps_dir / "concept-map.generated.md"
+    domain_map.write_text("".join(domain_lines), encoding="utf-8")
+    concept_map.write_text("".join(concept_lines), encoding="utf-8")
+
+    print("✅ Maps rebuilt")
+    print(f"  domain-map: {domain_map.relative_to(root).as_posix()} ({len(domain_groups)} domains)")
+    print(f"  concept-map: {concept_map.relative_to(root).as_posix()} ({len(concepts)} concepts)")
+    print(f"  scanned registries: concepts={len(concept_rows)}, sources={len(source_rows)}, claims={len(claim_rows)}")
+    print(f"  scanned pages: {len(pages)}")
 
 # ─── main ──────────────────────────────────────────────
 
@@ -757,6 +1435,28 @@ def main():
     p_ingest.add_argument('--interactive', '-i', action='store_true')
     p_ingest.add_argument('--path', default=None)
 
+    # update-raw
+    p_update_raw = sub.add_parser('update-raw', help='回填 URL 抓取内容')
+    p_update_raw.add_argument('raw_path', help='raw 文件相对路径')
+    p_update_raw.add_argument('--content', required=True, help='内容文件路径或直接文本')
+    p_update_raw.add_argument('--path', default=None)
+
+    # compile
+    p_compile = sub.add_parser('compile', help='编译资料并登记 source-note')
+    p_compile.add_argument('source', help='文件路径、URL 或直接文本')
+    p_compile.add_argument('--level', choices=['L0', 'L1', 'L2', 'L3'], default='L2')
+    p_compile.add_argument('--path', default=None)
+
+    # promote
+    p_promote = sub.add_parser('promote', help='将 registry 条目提拔为正式页面')
+    p_promote.add_argument('id', help='concept/framework ID')
+    p_promote.add_argument('--type', choices=['concept', 'framework'], default=None)
+    p_promote.add_argument('--path', default=None)
+
+    # rebuild-maps
+    p_maps = sub.add_parser('rebuild-maps', help='重建 generated maps')
+    p_maps.add_argument('--path', default=None)
+
     # query
     p_query = sub.add_parser('query', help='查询知识库')
     p_query.add_argument('question', help='查询问题')
@@ -780,7 +1480,7 @@ def main():
     # registry
     p_registry = sub.add_parser('registry', help='读取或追加 registry')
     p_registry.add_argument('action', choices=['list', 'add'])
-    p_registry.add_argument('name', choices=['concept', 'claim', 'source'])
+    p_registry.add_argument('name', choices=['concept', 'framework', 'claim', 'source', 'page'])
     p_registry.add_argument('--entry', default='')
     p_registry.add_argument('--path', default=None)
 
@@ -850,6 +1550,14 @@ def main():
         cmd_init(args)
     elif args.command == 'ingest':
         cmd_ingest(args)
+    elif args.command == 'update-raw':
+        cmd_update_raw(args)
+    elif args.command == 'compile':
+        cmd_compile(args)
+    elif args.command == 'promote':
+        cmd_promote(args)
+    elif args.command == 'rebuild-maps':
+        cmd_rebuild_maps(args)
     elif args.command == 'query':
         cmd_query(args)
     elif args.command == 'lint':

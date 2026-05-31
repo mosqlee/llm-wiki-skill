@@ -56,6 +56,34 @@ python3 scripts/wiki.py ingest <file_or_url_or_text> [--interactive]
 
 详见 [references/ingest-flow.md](references/ingest-flow.md)。
 
+### update-raw - 回填 URL 正文
+```bash
+python3 scripts/wiki.py update-raw raw/articles/xxx.md --content <file_or_text>
+```
+用于 LLM agent 把 URL 抓取正文写回占位 raw 文件。
+会保留 `source_url`、计算 `sha256`，并自动 git commit。
+
+### compile - 编译资料
+```bash
+python3 scripts/wiki.py compile <file_or_url_or_text> [--level L0|L1|L2|L3]
+```
+保存 raw、生成 `source_id` 和 `compiled/source-notes/` 占位文件。
+自动登记 `source-registry`、追加 changelog/log，并提交 git。
+
+### promote - 提拔正式页面
+```bash
+python3 scripts/wiki.py promote <cpt_or_frm_id> [--type concept|framework]
+```
+从 concept/framework registry 读取条目并用 schema 模板渲染页面。
+写入 `wiki/concepts/` 或 `wiki/frameworks/`，更新状态和 `page-registry`。
+
+### rebuild-maps - 重建知识图谱
+```bash
+python3 scripts/wiki.py rebuild-maps
+```
+扫描 registry 和 wiki 页面 frontmatter/链接。
+生成 `maps/domain-map.generated.md` 与 `maps/concept-map.generated.md`。
+
 ### query - 查询知识库
 ```bash
 python3 scripts/wiki.py query "<question>"
