@@ -484,22 +484,27 @@ def cmd_ingest(args):
     title = ""
 
     if source.startswith('http://') or source.startswith('https://'):
-        # Fetch via zhipu web reader
-        reader = os.path.expanduser("~/.openclaw/workspace/skills/base/zhipu-toolkit/scripts/zhipu_api.py")
-        if os.path.exists(reader):
-            result = subprocess.run(
-                ["python3", reader, "read", source, "--format", "markdown"],
-                capture_output=True, text=True, timeout=60
-            )
-            content = result.stdout
-            if not content or len(content) < 100:
-                print("⚠️ Web fetch returned too little content, falling back to web_fetch")
-                content = ""
-        if not content:
-            print("❌ Failed to fetch URL. Try saving locally first.")
-            sys.exit(1)
+        # URL 场景：保存占位文件，由 LLM agent 用 web_extract 抓取后调用 update-raw 回填
         title = source.split('/')[-1][:50] or f"article-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         filename = f"{title}.md"
+        source_type = "article"
+        content = f"---\nsource_url: {source}\ningested: {datetime.now().strftime('%Y-%m-%d')}\n---\n\n<!-- NEEDS_AGENT_FETCH -->\n"
+        raw_path = os.path.join(root, "raw", category, filename)
+        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+        with open(raw_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"NEEDS_AGENT_FETCH: {source} -> raw/{category}/{filename}")
+        git_commit(root, f"ingest placeholder: {filename}")
+        return {
+            "content": "",
+            "title": title,
+            "category": category,
+            "filename": filename,
+            "raw_path": raw_path,
+            "raw_rel_path": f"raw/{category}/{filename}",
+            "source_type": source_type,
+            "needs_agent_fetch": True,
+        }
     elif os.path.isfile(source):
         with open(source, 'r', encoding='utf-8') as f:
             content = f.read()
